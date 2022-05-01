@@ -19,9 +19,9 @@
 package dev.kobalt.svg2asset.web.convert
 
 import dev.kobalt.svg2asset.web.resource.ResourceRepository
-import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Semaphore
-import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.withPermit
 import java.io.*
 
 object ConvertRepository {
@@ -35,39 +35,41 @@ object ConvertRepository {
     var resourcePath: String? = null
     var fontPath: String? = null
 
-    private val semaphore = Semaphore(1)
+    private val semaphore = Semaphore(5)
 
-    suspend fun Semaphore.acquireUse(method: () -> Unit) {
-        try {
-            acquire()
-            method()
-        } catch (e: Throwable) {
-            throw e
-        } finally {
-            release()
+    suspend fun convert(data: String, outputType: String, outputStream: OutputStream) = withContext(Dispatchers.IO) {
+        val process = ProcessBuilder(
+            "java",
+            "-jar", jarPath!!,
+            "--outputType", outputType
+        ).start()
+        val stdout = BufferedInputStream(process.inputStream)
+        val stderr = BufferedReader(InputStreamReader(process.errorStream))
+        val stdin = BufferedWriter(OutputStreamWriter(process.outputStream))
+        val stdinJob = launch(Dispatchers.IO) {
+            stdin.write(data)
+            stdin.flush()
+            stdin.close()
         }
+        val stderrJob = launch(Dispatchers.IO) {
+            println(stderr.readText())
+        }
+        val stdoutJob = async(Dispatchers.IO) {
+            outputStream.write(stdout.readBytes())
+        }
+        stdinJob.join()
+        stderrJob.join()
+        stdoutJob.await()
+        outputStream
     }
 
     suspend fun submit(data: String, outputType: String, outputStream: OutputStream): OutputStream {
         return withContext(Dispatchers.IO) {
-            semaphore.acquireUse {
-                val process = ProcessBuilder(
-                    "java",
-                    "-jar", jarPath!!,
-                    "--outputType", outputType
-                ).start()
-                BufferedWriter(OutputStreamWriter(process.outputStream)).use { stdin ->
-                    stdin.write(data); stdin.flush()
-                }
-                BufferedInputStream(process.inputStream).use { stdout ->
-                    outputStream.write(stdout.readBytes())
-                }
-                var s: String?
-                BufferedReader(InputStreamReader(process.errorStream)).use { stderr ->
-                    while (stderr.readLine().also { s = it } != null) println(s)
+            semaphore.withPermit {
+                withTimeout(5000) {
+                    convert(data, outputType, outputStream)
                 }
             }
-            outputStream
         }
     }
 
